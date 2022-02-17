@@ -2,20 +2,18 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"github.com/goware/urlx"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/labstack/gommon/log"
+	"github.com/urfave/cli/v2"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
+	"sync"
 	"time"
-)
-
-const (
-	YOUTUBEDL_PATH = "youtube-dl"
-	SERVER_PORT    = ":8000"
-	LOG_LEVEL      = log.DEBUG
 )
 
 type cacheEntry struct {
@@ -24,25 +22,91 @@ type cacheEntry struct {
 }
 
 var (
-	cache       = make(map[string]cacheEntry)
-	allowdHosts = map[string]struct{}{
+	port         int
+	youtubeDl    string
+	urlRoot      string
+	logLevel     string
+	cache        = make(map[string]cacheEntry)
+	cacheMutex   sync.Mutex
+	allowedHosts = map[string]struct{}{
 		"www.youtube.com": struct{}{},
 		"youtu.be":        struct{}{},
 	}
 )
 
 func main() {
-	e := echo.New()
-	e.Use(middleware.Logger())
-	e.Use(middleware.Recover())
-	e.GET("/*", handleRequest)
-	e.Logger.SetLevel(LOG_LEVEL)
-	e.Logger.Fatal(e.Start(SERVER_PORT))
+	app := cli.NewApp()
+	app.Name = "vrc-video-redirector"
+	app.Usage = "Video URL redirector for VRChat Quest"
+	app.Version = "0.2.0"
+	app.Flags = []cli.Flag{
+		&cli.IntFlag{
+			Name:        "port, p",
+			Value:       8000,
+			Destination: &port,
+			EnvVars:     []string{"VVR_PORT"},
+		},
+		&cli.StringFlag{
+			Name:        "youtube-dl, d",
+			Value:       "/usr/bin/youtube-dl",
+			Destination: &youtubeDl,
+			EnvVars:     []string{"VVR_YOUTUBE_DL"},
+		},
+		&cli.StringFlag{
+			Name:        "url-root, r",
+			Value:       "/",
+			Destination: &urlRoot,
+			EnvVars:     []string{"VVR_URL_ROOT"},
+		},
+		&cli.StringFlag{
+			Name:        "log-level, l",
+			Value:       "info",
+			Destination: &logLevel,
+			EnvVars:     []string{"VVR_LOG_LEVEL"},
+		},
+	}
+	app.Action = func(c *cli.Context) error {
+		e := echo.New()
+		e.Use(middleware.Logger())
+		e.Use(middleware.Recover())
+		e.GET(urlRoot+"*", handleRequest)
+		if l, ok := parseLogLevel(c.String("log-level")); ok {
+			e.Logger.SetLevel(l)
+		} else {
+			return errors.New("log-level must be one of [debug, info, warn, error, off]")
+		}
+		e.Logger.Infof("youtubeDl: %s", youtubeDl)
+		e.Logger.Infof("urlRoot: %s", urlRoot)
+
+		err := e.Start(":" + strconv.Itoa(port))
+		if err != nil {
+			e.Logger.Fatal(err)
+		}
+		return err
+	}
+	app.Run(os.Args)
+}
+
+func parseLogLevel(name string) (log.Lvl, bool) {
+	switch name {
+	case "debug":
+		return log.DEBUG, true
+	case "info":
+		return log.INFO, true
+	case "warn":
+		return log.WARN, true
+	case "error":
+		return log.ERROR, true
+	case "off":
+		return log.OFF, true
+	}
+	return log.OFF, false
 }
 
 func handleRequest(c echo.Context) error {
 	var err error
 	e := c.Echo()
+	e.Logger.Debugf("Path: %s", c.Param("*"))
 
 	// Normalize URL
 	u, err := urlx.Parse(c.Param("*"))
@@ -55,9 +119,13 @@ func handleRequest(c echo.Context) error {
 	e.Logger.Debugf("Normalized URL: %s", url)
 
 	// Validate URL
-	if _, ok := allowdHosts[u.Host]; !ok {
+	if _, ok := allowedHosts[u.Host]; !ok {
 		return c.String(http.StatusBadRequest, "Bad Request")
 	}
+
+	// Lock mutex
+	cacheMutex.Lock()
+	defer cacheMutex.Unlock()
 
 	// Check cache
 	if cached, ok := cache[url]; ok {
@@ -68,7 +136,7 @@ func handleRequest(c echo.Context) error {
 	}
 
 	// Resolve
-	result, err := exec.Command(YOUTUBEDL_PATH, "-g", url).Output()
+	result, err := exec.Command(youtubeDl, "-g", url).Output()
 	if err != nil {
 		return c.String(http.StatusBadGateway, "502 Bad Gateway")
 	}
