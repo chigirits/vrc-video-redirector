@@ -1,24 +1,44 @@
 package main
 
 import (
-	"bytes"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
 	"github.com/goware/urlx"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/labstack/gommon/log"
 	"github.com/urfave/cli/v2"
-	"net/http"
-	"os"
-	"os/exec"
-	"strconv"
-	"sync"
-	"time"
 )
 
+type videoFormat struct {
+	FormatID string `json:"format_id"`
+	Ext      string `json:"ext"`
+	URL      string `json:"url"`
+	Vcodec   string `json:"vcodec"`
+	Acodec   string `json:"acodec"`
+}
+
+type videoInfo struct {
+	ID          string         `json:"id"`
+	Title       string         `json:"title"`
+	Description string         `json:"description"`
+	Duration    int            `json:"duration"`
+	WebpageURL  string         `json:"webpage_url"`
+	Formats     []*videoFormat `json:"formats"`
+}
+
 type cacheEntry struct {
-	expire     time.Time
-	redirectTo string
+	expire      time.Time
+	videoFormat *videoFormat
+	videoInfo   *videoInfo
 }
 
 var (
@@ -26,11 +46,11 @@ var (
 	youtubeDl    string
 	urlRoot      string
 	logLevel     string
-	cache        = make(map[string]cacheEntry)
+	cache        = make(map[string]*cacheEntry)
 	cacheMutex   sync.Mutex
 	allowedHosts = map[string]struct{}{
-		"www.youtube.com": struct{}{},
-		"youtu.be":        struct{}{},
+		"www.youtube.com": {},
+		"youtu.be":        {},
 	}
 )
 
@@ -67,8 +87,11 @@ func main() {
 	}
 	app.Action = func(c *cli.Context) error {
 		e := echo.New()
+		e.HideBanner = true
 		e.Use(middleware.Logger())
 		e.Use(middleware.Recover())
+		e.Use(middleware.RequestID())
+		e.HEAD(urlRoot+"*", handleRequest)
 		e.GET(urlRoot+"*", handleRequest)
 		if l, ok := parseLogLevel(c.String("log-level")); ok {
 			e.Logger.SetLevel(l)
@@ -103,16 +126,51 @@ func parseLogLevel(name string) (log.Lvl, bool) {
 	return log.OFF, false
 }
 
+func resolve(url string) (*videoFormat, *videoInfo, error) {
+	b, err := exec.Command(youtubeDl, "-J", url).Output()
+	if err != nil {
+		return nil, nil, err
+	}
+	var info *videoInfo
+	if err := json.Unmarshal(b, &info); err != nil {
+		return nil, nil, err
+	}
+	var second *videoFormat
+	for _, f := range info.Formats {
+		if !(f.Ext == "webm" || f.Ext == "mp4") {
+			continue
+		}
+		if second == nil {
+			second = f
+		}
+		if f.Vcodec == "none" || f.Acodec == "none" {
+			continue
+		}
+		return f, info, nil
+	}
+	if second != nil {
+		return second, info, nil
+	}
+	if len(info.Formats) == 0 {
+		return nil, info, errors.New("No format")
+	}
+	return info.Formats[0], info, nil
+}
+
 func handleRequest(c echo.Context) error {
 	var err error
 	e := c.Echo()
-	e.Logger.Debugf("Path: %s", c.Param("*"))
+	path := c.Param("*")
+	e.Logger.Debugf("Path: %s", path)
 
 	// Normalize URL
-	u, err := urlx.Parse(c.Param("*"))
+	u, err := urlx.Parse(path)
 	if err != nil {
 		e.Logger.Warnf("Failed to parse URL: %s", err.Error())
 		return c.String(http.StatusBadRequest, "Bad Request")
+	}
+	if !strings.HasPrefix(path, u.Scheme+":") {
+		u.Scheme = "https"
 	}
 	u.RawQuery = c.QueryString()
 	url, _ := urlx.Normalize(u)
@@ -120,7 +178,14 @@ func handleRequest(c echo.Context) error {
 
 	// Validate URL
 	if _, ok := allowedHosts[u.Host]; !ok {
-		return c.String(http.StatusBadRequest, "Bad Request")
+		e.Logger.Debugf("Host not allowed: %s", url)
+		return c.String(http.StatusNotFound, "Not Found")
+	}
+
+	// Redirect to web page on Windows
+	if strings.Contains(c.Request().UserAgent(), "Windows") {
+		e.Logger.Debugf("Redirect to web page: %s", url)
+		return c.Redirect(http.StatusFound, url)
 	}
 
 	// Lock mutex
@@ -130,36 +195,37 @@ func handleRequest(c echo.Context) error {
 	// Check cache
 	if cached, ok := cache[url]; ok {
 		if time.Now().Before(cached.expire) {
-			return c.Redirect(http.StatusFound, cached.redirectTo)
+			e.Logger.Debugf("Using cache: %s", cached.videoFormat.URL)
+			return c.Redirect(http.StatusFound, cached.videoFormat.URL)
 		}
 		delete(cache, url)
 	}
 
 	// Resolve
-	result, err := exec.Command(youtubeDl, "-g", url).Output()
+	videoFormat, videoInfo, err := resolve(url)
 	if err != nil {
-		return c.String(http.StatusBadGateway, "502 Bad Gateway")
+		e.Logger.Info("Could not resolve: %s", err.Error())
+		return c.Redirect(http.StatusFound, url)
 	}
-	lines := bytes.SplitN(result, []byte{'\n'}, 2)
-	redirectTo := string(lines[0])
-	e.Logger.Debugf("Resolved URL: %s", redirectTo)
+	e.Logger.Debugf("Resolved URL: %s", videoFormat.URL)
 
 	// Cache
-	if r, err := urlx.Parse(redirectTo); err == nil {
+	if r, err := urlx.Parse(videoFormat.URL); err == nil {
 		q := r.Query()
-		e.Logger.Debugf("Query: %#v", q)
+		// e.Logger.Debugf("Query: %#v", q)
 		if 0 < len(q["expire"]) {
 			if expireUnix, err := strconv.Atoi(q["expire"][0]); err == nil {
 				expire := time.Unix(int64(expireUnix), 0)
 				e.Logger.Debugf("Expire: %s", expire)
-				cache[url] = cacheEntry{
-					expire:     expire,
-					redirectTo: redirectTo,
+				cache[url] = &cacheEntry{
+					expire:      expire,
+					videoFormat: videoFormat,
+					videoInfo:   videoInfo,
 				}
 			}
 		}
 	}
 
 	// Response
-	return c.Redirect(http.StatusFound, redirectTo)
+	return c.Redirect(http.StatusFound, videoFormat.URL)
 }
