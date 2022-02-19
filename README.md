@@ -2,6 +2,10 @@
 
 **WORK IN PROGRESS**
 
+## Requirement
+
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) (instead of youtube-dl)
+
 ## Usage
 
 ```
