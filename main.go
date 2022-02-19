@@ -57,32 +57,32 @@ var (
 func main() {
 	app := cli.NewApp()
 	app.Name = "vrc-video-redirector"
-	app.Usage = "Video URL redirector for VRChat Quest"
-	app.Version = "0.2.0"
+	app.Usage = "Video URL redirector for VRChat on Meta Quest"
+	app.Version = "0.3.0"
 	app.Flags = []cli.Flag{
 		&cli.IntFlag{
 			Name:        "port, p",
 			Value:       8000,
 			Destination: &port,
-			EnvVars:     []string{"VVR_PORT"},
+			Usage:       "port number of the HTTP server",
 		},
 		&cli.StringFlag{
 			Name:        "youtube-dl, d",
 			Value:       "/usr/bin/youtube-dl",
 			Destination: &youtubeDl,
-			EnvVars:     []string{"VVR_YOUTUBE_DL"},
+			Usage:       "path to youtube-dl command",
 		},
 		&cli.StringFlag{
 			Name:        "url-root, r",
 			Value:       "/",
 			Destination: &urlRoot,
-			EnvVars:     []string{"VVR_URL_ROOT"},
+			Usage:       "URL root path excluding before the domain name (for reverse proxy)",
 		},
 		&cli.StringFlag{
 			Name:        "log-level, l",
 			Value:       "info",
 			Destination: &logLevel,
-			EnvVars:     []string{"VVR_LOG_LEVEL"},
+			Usage:       "log level [debug, info, warn, error, off]",
 		},
 	}
 	app.Action = func(c *cli.Context) error {
