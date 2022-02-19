@@ -45,6 +45,7 @@ var (
 	port         int
 	youtubeDl    string
 	urlRoot      string
+	enableCache  = true
 	logLevel     string
 	cache        = make(map[string]*cacheEntry)
 	cacheMutex   sync.Mutex
@@ -126,8 +127,9 @@ func parseLogLevel(name string) (log.Lvl, bool) {
 	return log.OFF, false
 }
 
-func resolve(url string) (*videoFormat, *videoInfo, error) {
-	b, err := exec.Command(youtubeDl, "-J", url).Output()
+func resolve(url string, options []string) (*videoFormat, *videoInfo, error) {
+	options = append(options, "-J", url)
+	b, err := exec.Command(youtubeDl, options...).Output()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -135,9 +137,11 @@ func resolve(url string) (*videoFormat, *videoInfo, error) {
 	if err := json.Unmarshal(b, &info); err != nil {
 		return nil, nil, err
 	}
+	var first *videoFormat
 	var second *videoFormat
 	for _, f := range info.Formats {
-		if !(f.Ext == "webm" || f.Ext == "mp4") {
+		// if !(f.Ext == "webm" || f.Ext == "mp4") {
+		if f.Ext != "mp4" {
 			continue
 		}
 		if second == nil {
@@ -146,7 +150,10 @@ func resolve(url string) (*videoFormat, *videoInfo, error) {
 		if f.Vcodec == "none" || f.Acodec == "none" {
 			continue
 		}
-		return f, info, nil
+		first = f
+	}
+	if first != nil {
+		return first, info, nil
 	}
 	if second != nil {
 		return second, info, nil
@@ -160,8 +167,20 @@ func resolve(url string) (*videoFormat, *videoInfo, error) {
 func handleRequest(c echo.Context) error {
 	var err error
 	e := c.Echo()
+	request := c.Request()
+	e.Logger.Debugf("Access: %#v", request.Header)
+
+	thruHeader := func(options []string, name string) []string {
+		if 0 < len(request.Header[name]) {
+			return append(options, "--add-header", name+":"+request.Header[name][0])
+		}
+		return options
+	}
+	var options []string
+	options = thruHeader(options, "User-Agent")
+	// options = thruHeader(options, "X-Forwarded-For")
+	// options = thruHeader(options, "X-Real-Ip")
 	path := c.Param("*")
-	e.Logger.Debugf("Path: %s", path)
 
 	// Normalize URL
 	u, err := urlx.Parse(path)
@@ -183,7 +202,7 @@ func handleRequest(c echo.Context) error {
 	}
 
 	// Redirect to web page on Windows
-	if strings.Contains(c.Request().UserAgent(), "Windows") {
+	if strings.Contains(request.UserAgent(), "Windows") {
 		e.Logger.Debugf("Redirect to web page: %s", url)
 		return c.Redirect(http.StatusFound, url)
 	}
@@ -202,9 +221,9 @@ func handleRequest(c echo.Context) error {
 	}
 
 	// Resolve
-	videoFormat, videoInfo, err := resolve(url)
+	videoFormat, videoInfo, err := resolve(url, options)
 	if err != nil {
-		e.Logger.Info("Could not resolve: %s", err.Error())
+		e.Logger.Infof("Could not resolve: %s", err.Error())
 		return c.Redirect(http.StatusFound, url)
 	}
 	e.Logger.Debugf("Resolved URL: %s", videoFormat.URL)
@@ -213,7 +232,7 @@ func handleRequest(c echo.Context) error {
 	if r, err := urlx.Parse(videoFormat.URL); err == nil {
 		q := r.Query()
 		// e.Logger.Debugf("Query: %#v", q)
-		if 0 < len(q["expire"]) {
+		if enableCache && 0 < len(q["expire"]) {
 			if expireUnix, err := strconv.Atoi(q["expire"][0]); err == nil {
 				expire := time.Unix(int64(expireUnix), 0)
 				e.Logger.Debugf("Expire: %s", expire)
