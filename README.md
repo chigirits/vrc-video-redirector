@@ -1,8 +1,8 @@
 # vrc-video-redirector
 
 This is an HTTP server that redirects the video URL to a playable one in VRChat for Meta Quest.
-This is an incomplete clone of the ["Jinai System"](https://t-ne.x0.to/).
-You can use it on your own server without worrying about the status of the original Jinnnai System.
+This is an incomplete clone of the ["Jinnai System"](https://t-ne.x0.to/).
+You can use it on your own server without worrying about the status of the original Jinnai System.
 
 ## Requirements
 
