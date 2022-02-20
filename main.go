@@ -52,7 +52,7 @@ func main() {
 		},
 		&cli.StringFlag{
 			Name:        "ytdlp-path, d",
-			Value:       "/usr/bin/yt-dlp",
+			Value:       "/usr/local/bin/yt-dlp",
 			Destination: &ytdlpPath,
 			Usage:       "path to yt-dlp command",
 		},
@@ -66,7 +66,7 @@ func main() {
 			Name:        "disable-cache, C",
 			Value:       false,
 			Destination: &disableCache,
-			Usage:       "Disable cache",
+			Usage:       "disable cache",
 		},
 		&cli.StringFlag{
 			Name:        "log-level, l",
