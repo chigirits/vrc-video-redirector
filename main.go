@@ -42,16 +42,27 @@ type cacheEntry struct {
 }
 
 var (
-	port         int
-	youtubeDl    string
-	urlRoot      string
-	enableCache  = true
-	logLevel     string
-	cache        = make(map[string]*cacheEntry)
-	cacheMutex   sync.Mutex
-	allowedHosts = map[string]struct{}{
+	port           int
+	ytdlpPath      string
+	urlRoot        string
+	disableCache   = true
+	logLevel       string
+	cache          = make(map[string]*cacheEntry)
+	cacheMutex     sync.Mutex
+	trustedDomains = map[string]struct{}{
 		"www.youtube.com": {},
 		"youtu.be":        {},
+	}
+	supportedExts = map[string]struct{}{
+		"mp4": {},
+		// "webm": {},
+	}
+	stringToLogLevel = map[string]log.Lvl{
+		"debug": log.DEBUG,
+		"info":  log.INFO,
+		"warn":  log.WARN,
+		"error": log.ERROR,
+		"off":   log.OFF,
 	}
 )
 
@@ -59,7 +70,7 @@ func main() {
 	app := cli.NewApp()
 	app.Name = "vrc-video-redirector"
 	app.Usage = "Video URL redirector for VRChat on Meta Quest"
-	app.Version = "0.3.0"
+	app.Version = "0.4.0"
 	app.Flags = []cli.Flag{
 		&cli.IntFlag{
 			Name:        "port, p",
@@ -68,16 +79,22 @@ func main() {
 			Usage:       "port number of the HTTP server",
 		},
 		&cli.StringFlag{
-			Name:        "youtube-dl, d",
-			Value:       "/usr/bin/youtube-dl",
-			Destination: &youtubeDl,
-			Usage:       "path to youtube-dl command",
+			Name:        "ytdlp-path, d",
+			Value:       "/usr/bin/yt-dlp",
+			Destination: &ytdlpPath,
+			Usage:       "path to yt-dlp command",
 		},
 		&cli.StringFlag{
 			Name:        "url-root, r",
 			Value:       "/",
 			Destination: &urlRoot,
 			Usage:       "URL root path excluding before the domain name (for reverse proxy)",
+		},
+		&cli.BoolFlag{
+			Name:        "disable-cache, C",
+			Value:       false,
+			Destination: &disableCache,
+			Usage:       "Disable cache",
 		},
 		&cli.StringFlag{
 			Name:        "log-level, l",
@@ -94,13 +111,14 @@ func main() {
 		e.Use(middleware.RequestID())
 		e.HEAD(urlRoot+"*", handleRequest)
 		e.GET(urlRoot+"*", handleRequest)
-		if l, ok := parseLogLevel(c.String("log-level")); ok {
+		if l, ok := stringToLogLevel[strings.ToLower(logLevel)]; ok {
 			e.Logger.SetLevel(l)
 		} else {
 			return errors.New("log-level must be one of [debug, info, warn, error, off]")
 		}
-		e.Logger.Infof("youtubeDl: %s", youtubeDl)
+		e.Logger.Infof("ytdlpPath: %s", ytdlpPath)
 		e.Logger.Infof("urlRoot: %s", urlRoot)
+		e.Logger.Infof("logLevel: %s", logLevel)
 
 		err := e.Start(":" + strconv.Itoa(port))
 		if err != nil {
@@ -111,25 +129,9 @@ func main() {
 	app.Run(os.Args)
 }
 
-func parseLogLevel(name string) (log.Lvl, bool) {
-	switch name {
-	case "debug":
-		return log.DEBUG, true
-	case "info":
-		return log.INFO, true
-	case "warn":
-		return log.WARN, true
-	case "error":
-		return log.ERROR, true
-	case "off":
-		return log.OFF, true
-	}
-	return log.OFF, false
-}
-
 func resolve(url string, options []string) (*videoFormat, *videoInfo, error) {
 	options = append(options, "-J", url)
-	b, err := exec.Command(youtubeDl, options...).Output()
+	b, err := exec.Command(ytdlpPath, options...).Output()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -140,8 +142,7 @@ func resolve(url string, options []string) (*videoFormat, *videoInfo, error) {
 	var first *videoFormat
 	var second *videoFormat
 	for _, f := range info.Formats {
-		// if !(f.Ext == "webm" || f.Ext == "mp4") {
-		if f.Ext != "mp4" {
+		if _, ok := supportedExts[f.Ext]; !ok {
 			continue
 		}
 		if second == nil {
@@ -183,21 +184,18 @@ func handleRequest(c echo.Context) error {
 	path := c.Param("*")
 
 	// Normalize URL
-	u, err := urlx.Parse(path)
+	u, err := urlx.ParseWithDefaultScheme(path, "https")
 	if err != nil {
 		e.Logger.Warnf("Failed to parse URL: %s", err.Error())
 		return c.String(http.StatusBadRequest, "Bad Request")
-	}
-	if !strings.HasPrefix(path, u.Scheme+":") {
-		u.Scheme = "https"
 	}
 	u.RawQuery = c.QueryString()
 	url, _ := urlx.Normalize(u)
 	e.Logger.Debugf("Normalized URL: %s", url)
 
 	// Validate URL
-	if _, ok := allowedHosts[u.Host]; !ok {
-		e.Logger.Debugf("Host not allowed: %s", url)
+	if _, ok := trustedDomains[u.Host]; !ok {
+		e.Logger.Debugf("Untrusted domain: %s", url)
 		return c.String(http.StatusNotFound, "Not Found")
 	}
 
@@ -231,8 +229,7 @@ func handleRequest(c echo.Context) error {
 	// Cache
 	if r, err := urlx.Parse(videoFormat.URL); err == nil {
 		q := r.Query()
-		// e.Logger.Debugf("Query: %#v", q)
-		if enableCache && 0 < len(q["expire"]) {
+		if !disableCache && 0 < len(q["expire"]) {
 			if expireUnix, err := strconv.Atoi(q["expire"][0]); err == nil {
 				expire := time.Unix(int64(expireUnix), 0)
 				e.Logger.Debugf("Expire: %s", expire)
