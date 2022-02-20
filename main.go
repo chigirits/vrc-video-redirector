@@ -1,15 +1,11 @@
 package main
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/goware/urlx"
 	"github.com/labstack/echo/v4"
@@ -18,37 +14,13 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-type videoFormat struct {
-	FormatID string `json:"format_id"`
-	Ext      string `json:"ext"`
-	URL      string `json:"url"`
-	Vcodec   string `json:"vcodec"`
-	Acodec   string `json:"acodec"`
-}
-
-type videoInfo struct {
-	ID          string         `json:"id"`
-	Title       string         `json:"title"`
-	Description string         `json:"description"`
-	Duration    int            `json:"duration"`
-	WebpageURL  string         `json:"webpage_url"`
-	Formats     []*videoFormat `json:"formats"`
-}
-
-type cacheEntry struct {
-	expire      time.Time
-	videoFormat *videoFormat
-	videoInfo   *videoInfo
-}
-
 var (
 	port           int
 	ytdlpPath      string
 	urlRoot        string
-	disableCache   = true
+	disableCache   bool
 	logLevel       string
-	cache          = make(map[string]*cacheEntry)
-	cacheMutex     sync.Mutex
+	cache          *Cache
 	trustedDomains = map[string]struct{}{
 		"www.youtube.com": {},
 		"youtu.be":        {},
@@ -69,7 +41,7 @@ var (
 func main() {
 	app := cli.NewApp()
 	app.Name = "vrc-video-redirector"
-	app.Usage = "Video URL redirector for VRChat on Meta Quest"
+	app.Usage = "Redirect the video URL to a playable one in VRChat for Meta Quest."
 	app.Version = "0.4.0"
 	app.Flags = []cli.Flag{
 		&cli.IntFlag{
@@ -104,6 +76,7 @@ func main() {
 		},
 	}
 	app.Action = func(c *cli.Context) error {
+		cache = NewCache()
 		e := echo.New()
 		e.HideBanner = true
 		e.Use(middleware.Logger())
@@ -127,42 +100,6 @@ func main() {
 		return err
 	}
 	app.Run(os.Args)
-}
-
-func resolve(url string, options []string) (*videoFormat, *videoInfo, error) {
-	options = append(options, "-J", url)
-	b, err := exec.Command(ytdlpPath, options...).Output()
-	if err != nil {
-		return nil, nil, err
-	}
-	var info *videoInfo
-	if err := json.Unmarshal(b, &info); err != nil {
-		return nil, nil, err
-	}
-	var first *videoFormat
-	var second *videoFormat
-	for _, f := range info.Formats {
-		if _, ok := supportedExts[f.Ext]; !ok {
-			continue
-		}
-		if second == nil {
-			second = f
-		}
-		if f.Vcodec == "none" || f.Acodec == "none" {
-			continue
-		}
-		first = f
-	}
-	if first != nil {
-		return first, info, nil
-	}
-	if second != nil {
-		return second, info, nil
-	}
-	if len(info.Formats) == 0 {
-		return nil, info, errors.New("No format")
-	}
-	return info.Formats[0], info, nil
 }
 
 func handleRequest(c echo.Context) error {
@@ -206,16 +143,13 @@ func handleRequest(c echo.Context) error {
 	}
 
 	// Lock mutex
-	cacheMutex.Lock()
-	defer cacheMutex.Unlock()
+	cache.Mutex.Lock()
+	defer cache.Mutex.Unlock()
 
 	// Check cache
-	if cached, ok := cache[url]; ok {
-		if time.Now().Before(cached.expire) {
-			e.Logger.Debugf("Using cache: %s", cached.videoFormat.URL)
-			return c.Redirect(http.StatusFound, cached.videoFormat.URL)
-		}
-		delete(cache, url)
+	if cached, ok := cache.Load(url); ok {
+		e.Logger.Debugf("Using cache: %s", cached.Format.URL)
+		return c.Redirect(http.StatusFound, cached.Format.URL)
 	}
 
 	// Resolve
@@ -227,19 +161,8 @@ func handleRequest(c echo.Context) error {
 	e.Logger.Debugf("Resolved URL: %s", videoFormat.URL)
 
 	// Cache
-	if r, err := urlx.Parse(videoFormat.URL); err == nil {
-		q := r.Query()
-		if !disableCache && 0 < len(q["expire"]) {
-			if expireUnix, err := strconv.Atoi(q["expire"][0]); err == nil {
-				expire := time.Unix(int64(expireUnix), 0)
-				e.Logger.Debugf("Expire: %s", expire)
-				cache[url] = &cacheEntry{
-					expire:      expire,
-					videoFormat: videoFormat,
-					videoInfo:   videoInfo,
-				}
-			}
-		}
+	if !disableCache {
+		cache.Store(videoFormat, videoInfo, url)
 	}
 
 	// Response
